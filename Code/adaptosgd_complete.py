@@ -74,6 +74,10 @@ class SystemConfig:
     network_instability_end: int = 120
     network_delay_factor: float = 2.0
 
+    # NEW — Hysteresis: consecutive "clean" iterations required before switching
+    # back from PS → AllReduce (Section 2.4 of design doc).
+    hysteresis_window: int = 5
+
 
 @dataclass
 class MetricsSnapshot:
@@ -89,6 +93,8 @@ class MetricsSnapshot:
     failed_workers: int
     communication_overhead: float
     timestamp: float
+    # NEW — expose whether a SYNC_PARAMS broadcast occurred this iteration.
+    sync_params_event: bool = False
 
 
 # ============================================================================
@@ -172,12 +178,19 @@ class StragglerMonitor:
 
 
 # ============================================================================
-# COMPONENT 2: ADAPTIVE SWITCHER
+# COMPONENT 2: ADAPTIVE SWITCHER  (with Hysteresis — Section 2.4)
 # ============================================================================
 
 
 class AdaptiveSwitcher:
-    """Adaptive strategy selector between Ring AllReduce and Parameter Server."""
+    """Adaptive strategy selector between Ring AllReduce and Parameter Server.
+
+    Hysteresis (Section 2.4):
+        When in PS mode, the switcher does NOT immediately revert to AllReduce
+        the moment a straggler clears.  Instead it requires `hysteresis_window`
+        consecutive "clean" (no straggler detected) iterations before committing
+        to the switch-back.  This prevents rapid thrashing between modes.
+    """
 
     def __init__(self, config: SystemConfig):
         self.config = config
@@ -185,37 +198,103 @@ class AdaptiveSwitcher:
         self.current_mode = CommunicationMode.RING_ALLREDUCE
         self.switch_history: List[Dict] = []
 
-    def evaluate_and_switch(self, worker_times: List[float], iteration: int) -> CommunicationMode:
+        # NEW — hysteresis state.
+        self._clean_streak: int = 0  # consecutive iters with no straggler detected
+
+    def evaluate_and_switch(self, worker_times: List[float], iteration: int) -> Tuple[CommunicationMode, bool]:
+        """Return (new_mode, sync_params_needed).
+
+        sync_params_needed is True only when switching PS → AllReduce so the
+        caller can simulate a SYNC_PARAMS broadcast (Section 4.3).
+        """
         detected, straggler_id, score = self.monitor.update(worker_times, iteration)
+        sync_params_needed = False
 
-        if detected and self.current_mode == CommunicationMode.RING_ALLREDUCE:
-            self.current_mode = CommunicationMode.PARAMETER_SERVER
-            self.switch_history.append(
-                {
-                    "iteration": iteration,
-                    "from": "ring_allreduce",
-                    "to": "parameter_server",
-                    "straggler_id": straggler_id,
-                    "score": score,
-                }
-            )
-        elif not detected and self.current_mode == CommunicationMode.PARAMETER_SERVER:
-            self.current_mode = CommunicationMode.RING_ALLREDUCE
-            self.switch_history.append(
-                {
-                    "iteration": iteration,
-                    "from": "parameter_server",
-                    "to": "ring_allreduce",
-                    "straggler_id": -1,
-                    "score": score,
-                }
-            )
+        if detected:
+            # Reset the clean-streak whenever a straggler is (re-)detected.
+            self._clean_streak = 0
 
-        return self.current_mode
+            if self.current_mode == CommunicationMode.RING_ALLREDUCE:
+                self.current_mode = CommunicationMode.PARAMETER_SERVER
+                self.switch_history.append(
+                    {
+                        "iteration": iteration,
+                        "from": "ring_allreduce",
+                        "to": "parameter_server",
+                        "straggler_id": straggler_id,
+                        "score": score,
+                    }
+                )
+        else:
+            # Straggler gone — increment clean streak and only switch back once
+            # hysteresis_window consecutive clean iterations have elapsed.
+            if self.current_mode == CommunicationMode.PARAMETER_SERVER:
+                self._clean_streak += 1
+                if self._clean_streak >= self.config.hysteresis_window:
+                    self._clean_streak = 0
+                    self.current_mode = CommunicationMode.RING_ALLREDUCE
+                    sync_params_needed = True  # trigger SYNC_PARAMS broadcast
+                    self.switch_history.append(
+                        {
+                            "iteration": iteration,
+                            "from": "parameter_server",
+                            "to": "ring_allreduce",
+                            "straggler_id": -1,
+                            "score": score,
+                        }
+                    )
+
+        return self.current_mode, sync_params_needed
 
 
 # ============================================================================
-# COMPONENT 3: DISTRIBUTED TRAINING ENGINE
+# COMPONENT 3: SSP ENFORCER  (NEW — Section 3 / staleness bound)
+# ============================================================================
+
+
+class SSPEnforcer:
+    """Enforces the Stale Synchronous Parallel invariant during PS mode.
+
+    The invariant: the fastest worker may not be more than `staleness_bound`
+    iterations ahead of the slowest active worker.  When a worker would exceed
+    this bound, _enforce() returns True and the caller skips applying that
+    worker's gradient for this iteration (simulating a blocking wait).
+    """
+
+    def __init__(self, staleness_bound: int):
+        self.staleness_bound = staleness_bound
+        self._worker_versions: Dict[int, int] = {}  # worker_id → local iteration count
+
+    def reset(self, num_workers: int) -> None:
+        self._worker_versions = {i: 0 for i in range(num_workers)}
+
+    def advance(self, worker_id: int) -> None:
+        """Increment the logical iteration counter for worker_id."""
+        self._worker_versions[worker_id] = self._worker_versions.get(worker_id, 0) + 1
+
+    def is_blocked(self, worker_id: int) -> bool:
+        """Return True if applying this worker's gradient would violate SSP.
+
+        A worker is blocked when its local version exceeds the minimum version
+        among all workers by more than staleness_bound.
+        """
+        if not self._worker_versions:
+            return False
+        min_version = min(self._worker_versions.values())
+        worker_version = self._worker_versions.get(worker_id, 0)
+        return (worker_version - min_version) >= self.staleness_bound
+
+    def get_staleness(self, global_version: int) -> int:
+        """Return current staleness: gap between fastest and slowest worker."""
+        if not self._worker_versions:
+            return 0
+        min_version = min(self._worker_versions.values())
+        max_version = max(self._worker_versions.values())
+        return max(0, max_version - min_version)
+
+
+# ============================================================================
+# COMPONENT 4: DISTRIBUTED TRAINING ENGINE
 # ============================================================================
 
 
@@ -233,6 +312,9 @@ class DistributedTrainer:
         self.switcher: Optional[AdaptiveSwitcher] = None
         self.current_mode = CommunicationMode.RING_ALLREDUCE
         self.switch_history: List[Dict] = []
+
+        # NEW — SSP enforcer used during PS (and adaptive-PS) mode.
+        self._ssp = SSPEnforcer(config.staleness_bound)
 
     def _simulate_straggler(self, iteration: int, condition: str) -> None:
         if condition == "static":
@@ -262,6 +344,19 @@ class DistributedTrainer:
     def _apply_gradient(self, gradient: np.ndarray) -> None:
         self.model_params -= self.config.learning_rate * gradient
         self.model_version += 1
+
+    # NEW — SYNC_PARAMS broadcast (Section 4.3).
+    def _sync_params_broadcast(self) -> None:
+        """Simulate broadcasting the global model to all workers.
+
+        In a real system this would send self.model_params to every worker so
+        they all start the next Ring AllReduce round with identical parameters,
+        re-establishing strong consistency after a PS phase.  Here we record
+        the event; the model_params tensor is already the single source of
+        truth in this simulation, so no data copy is needed.
+        """
+        # Mark that a sync happened so MetricsSnapshot can expose it.
+        self._sync_event_this_iter = True
 
     def _get_loss(self) -> float:
         noise = np.random.normal(0.0, 0.01)
@@ -336,9 +431,15 @@ class DistributedTrainer:
         self.straggler_active = False
         self.straggler_worker = -1
 
+        # Reset SSP enforcer for a fresh run.
+        self._ssp.reset(self.config.num_workers)
+
         start_time = time.time()
 
         def run_iteration(iteration: int, process_pool: Optional[ProcessPoolExecutor]) -> None:
+            # Reset per-iteration SYNC_PARAMS flag.
+            self._sync_event_this_iter = False
+
             self._simulate_straggler(iteration, condition)
             failed_workers, network_factor = self._simulate_failures(iteration, condition)
 
@@ -358,7 +459,7 @@ class DistributedTrainer:
 
             if self.mode == CommunicationMode.ADAPTIVE:
                 if iteration % self.config.monitor_window == 0 or self.switcher.monitor.straggler_detected:
-                    new_mode = self.switcher.evaluate_and_switch(monitor_times, iteration)
+                    new_mode, sync_needed = self.switcher.evaluate_and_switch(monitor_times, iteration)
                     if new_mode != self.current_mode:
                         self.current_mode = new_mode
                         self.switch_history.append(
@@ -368,7 +469,13 @@ class DistributedTrainer:
                                 "straggler_detected": self.switcher.monitor.straggler_detected,
                             }
                         )
+                    # Trigger SYNC_PARAMS broadcast when reverting to AllReduce.
+                    if sync_needed:
+                        self._sync_params_broadcast()
 
+            # ----------------------------------------------------------------
+            # Ring AllReduce path — unchanged logic, zero straggler waits.
+            # ----------------------------------------------------------------
             if self.mode == CommunicationMode.RING_ALLREDUCE or (
                 self.mode == CommunicationMode.ADAPTIVE and self.current_mode == CommunicationMode.RING_ALLREDUCE
             ):
@@ -384,16 +491,35 @@ class DistributedTrainer:
                 if valid_grads:
                     avg_grad = np.mean(valid_grads, axis=0)
                     self._apply_gradient(avg_grad)
+
+            # ----------------------------------------------------------------
+            # Parameter Server path — NOW with SSP hard enforcement.
+            # ----------------------------------------------------------------
             else:
                 communication_overhead = (0.002 + 0.0005 * failed_count) * network_factor
                 iteration_time = float(np.mean(valid_times) + communication_overhead)
                 idle_time = 0.0
 
                 for worker_id, grad in enumerate(gradients):
-                    if worker_id not in failed_workers:
-                        self._apply_gradient(grad)
+                    if worker_id in failed_workers:
+                        continue
 
-                staleness = min(self.config.staleness_bound, max(0, self.model_version - iteration))
+                    # NEW — SSP enforcement: skip (block) this worker's gradient
+                    # if it would exceed the staleness bound relative to the
+                    # slowest worker.  This simulates the server making the fast
+                    # worker wait, preserving the SSP invariant.
+                    self._ssp.advance(worker_id)
+                    if self._ssp.is_blocked(worker_id):
+                        # Worker is too far ahead — do NOT apply its gradient
+                        # this iteration (it must wait for the laggards).
+                        continue
+
+                    self._apply_gradient(grad)
+
+                # Compute staleness from the SSP enforcer for accurate metrics.
+                staleness = self._ssp.get_staleness(self.model_version)
+                # Clamp to the configured bound for reporting consistency.
+                staleness = min(self.config.staleness_bound, staleness)
 
             loss = self._get_loss()
             throughput = 1.0 / iteration_time if iteration_time > 0 else 0.0
@@ -409,6 +535,7 @@ class DistributedTrainer:
                 failed_workers=failed_count,
                 communication_overhead=communication_overhead,
                 timestamp=time.time() - start_time,
+                sync_params_event=self._sync_event_this_iter,  # NEW
             )
             self.metrics.append(snapshot)
 
@@ -448,6 +575,8 @@ class ExperimentRunner:
         staleness_values = [m.gradient_staleness for m in metrics]
         failed_values = [m.failed_workers for m in metrics]
         comm_values = [m.communication_overhead for m in metrics]
+        # NEW — count SYNC_PARAMS events across the run.
+        sync_event_count = sum(1 for m in metrics if m.sync_params_event)
 
         convergence_iter = None
         for m in metrics:
@@ -472,6 +601,7 @@ class ExperimentRunner:
             "total_time": float(metrics[-1].timestamp),
             "raw_metrics": metrics,
             "switch_history": trainer.switch_history if system_type == CommunicationMode.ADAPTIVE.value else [],
+            "sync_event_count": sync_event_count,  # NEW
         }
 
     def run_all(self, num_runs: int = 5, include_extended: bool = True) -> pd.DataFrame:
@@ -516,6 +646,7 @@ class ExperimentRunner:
                     "failed_workers_mean": float(np.mean([r["mean_failed_workers"] for r in run_results])),
                     "comm_overhead_mean": float(np.mean([r["mean_communication_overhead"] for r in run_results])),
                     "convergence_mean": float(np.mean(valid_convergence)) if valid_convergence else None,
+                    "sync_events_mean": float(np.mean([r["sync_event_count"] for r in run_results])),  # NEW
                 }
                 self.results[f"{system}_{condition}"] = agg
 
@@ -526,6 +657,8 @@ class ExperimentRunner:
                 print(f"    Avg Staleness: {agg['staleness_mean']:.2f}")
                 print(f"    Failed Workers: {agg['failed_workers_mean']:.2f}")
                 print(f"    Comm Overhead: {agg['comm_overhead_mean']:.4f}s")
+                if system == CommunicationMode.ADAPTIVE.value:
+                    print(f"    SYNC_PARAMS events (avg): {agg['sync_events_mean']:.1f}")
 
         return pd.DataFrame(all_results)
 
@@ -624,10 +757,17 @@ def generate_core_visualizations(runner: ExperimentRunner, results_df: pd.DataFr
         switch_modes = [1 if s["mode"] == CommunicationMode.PARAMETER_SERVER.value else 0 for s in switch_history]
         ax6.step(switch_iterations, switch_modes, where="post", linewidth=3, color="#2ECC71")
         ax6.fill_between(switch_iterations, switch_modes, step="post", alpha=0.3, color="#2ECC71")
+
+    # NEW — mark SYNC_PARAMS events as vertical dashed lines.
+    raw_metrics = adaptive_dynamic["raw_metrics"]
+    sync_iters = [m.iteration for m in raw_metrics if m.sync_params_event]
+    for si in sync_iters:
+        ax6.axvline(si, color="orange", linestyle="--", linewidth=1.5, alpha=0.8, label="SYNC_PARAMS" if si == sync_iters[0] else "")
+
     ax6.axvspan(50, 100, alpha=0.2, color="red", label="Straggler Active")
     ax6.set_xlabel("Iteration", fontweight="bold")
     ax6.set_ylabel("Communication Mode", fontweight="bold")
-    ax6.set_title("AdaptoSGD Switching", fontweight="bold")
+    ax6.set_title("AdaptoSGD Switching (+ SYNC_PARAMS)", fontweight="bold")
     ax6.set_yticks([0, 1])
     ax6.set_yticklabels(["Ring", "PS"])
     ax6.legend()
@@ -713,6 +853,7 @@ def run_sensitivity_analysis(base_config: SystemConfig, output_dir: str, show_pl
                         "throughput": result["mean_throughput"],
                         "final_loss": result["final_loss"],
                         "switch_count": len(result["switch_history"]),
+                        "sync_event_count": result["sync_event_count"],  # NEW
                     }
                 )
 
@@ -795,11 +936,13 @@ def parse_args() -> argparse.Namespace:
         help="Execution backend",
     )
     parser.add_argument("--sleep-scale", type=float, default=0.0, help="Wall-clock emulation scale for multiprocess mode")
-    parser.add_argument("--output-dir", type=str, default="output", help="Output directory")
+    parser.add_argument("--output-dir", type=str, default="../output", help="Output directory")
     parser.add_argument("--no-plots", action="store_true", help="Disable interactive plot display")
     parser.add_argument("--no-extended", action="store_true", help="Skip worker-failure and network-instability scenarios")
     parser.add_argument("--no-sensitivity", action="store_true", help="Skip sensitivity/scalability analysis")
     parser.add_argument("--quick", action="store_true", help="Quick smoke run")
+    # NEW — expose hysteresis window via CLI.
+    parser.add_argument("--hysteresis-window", type=int, default=5, help="Consecutive clean iterations before PS→Ring revert")
 
     return parser.parse_args()
 
@@ -823,6 +966,7 @@ def main() -> None:
         random_seed=args.seed,
         execution_backend=args.backend,
         sleep_scale=args.sleep_scale,
+        hysteresis_window=args.hysteresis_window,  # NEW
     )
 
     include_extended = not args.no_extended
@@ -837,6 +981,8 @@ def main() -> None:
     print(f"  Backend: {config.execution_backend}")
     print(f"  Straggler Threshold: {config.straggler_threshold}x")
     print(f"  Straggler Delay: {config.straggler_delay_factor}x")
+    print(f"  Hysteresis Window: {config.hysteresis_window} iters")  # NEW
+    print(f"  Staleness Bound (SSP): {config.staleness_bound}")       # NEW
     print(f"  Runs per condition: {args.num_runs}")
     print(f"  Total experiments: {total_experiments}")
 
@@ -870,7 +1016,7 @@ def main() -> None:
         system = next((name for name in known_systems if key.startswith(name + "_")), None)
         if system is None:
             continue
-        condition = key[len(system) + 1 :]
+        condition = key[len(system) + 1:]
         summary_rows.append(
             {
                 "System": system_display[system],
