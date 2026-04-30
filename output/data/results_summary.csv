@@ -1,0 +1,16 @@
+System,Condition,Throughput (iter/s),Final Loss,Avg Overhead (s),Avg Staleness,Avg Failed Workers,Avg Comm Overhead (s)
+AdaptoSGD,Dynamic,8.16 +- 0.00,-0.0062,0.0245,0.80,0.00,0.0675
+AdaptoSGD,Homogeneous,7.26 +- 0.00,-0.0064,0.0153,0.00,0.00,0.0800
+AdaptoSGD,Network Instability,6.46 +- 0.00,-0.0064,0.0153,0.00,0.00,0.1040
+AdaptoSGD,Static,13.70 +- 0.00,-0.0051,0.0132,4.50,0.00,0.0098
+AdaptoSGD,Worker Failure,7.27 +- 0.00,-0.0064,0.0152,0.00,0.10,0.0800
+Parameter Server,Dynamic,18.11 +- 0.00,-0.0049,0.0000,5.00,0.00,0.0020
+Parameter Server,Homogeneous,19.22 +- 0.00,-0.0049,0.0000,5.00,0.00,0.0020
+Parameter Server,Network Instability,19.01 +- 0.00,-0.0049,0.0000,5.00,0.00,0.0026
+Parameter Server,Static,14.79 +- 0.00,-0.0049,0.0000,5.00,0.00,0.0020
+Parameter Server,Worker Failure,19.22 +- 0.00,-0.0049,0.0000,5.00,0.10,0.0021
+Ring AllReduce,Dynamic,6.43 +- 0.00,-0.0064,0.0446,0.00,0.00,0.0800
+Ring AllReduce,Homogeneous,7.26 +- 0.00,-0.0064,0.0153,0.00,0.00,0.0800
+Ring AllReduce,Network Instability,6.46 +- 0.00,-0.0064,0.0153,0.00,0.00,0.1040
+Ring AllReduce,Static,3.92 +- 0.00,-0.0064,0.1324,0.00,0.00,0.0800
+Ring AllReduce,Worker Failure,7.27 +- 0.00,-0.0064,0.0152,0.00,0.10,0.0800
