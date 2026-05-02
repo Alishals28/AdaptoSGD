@@ -40,9 +40,6 @@ from src.monitor import StragglerMonitor
 from src.switcher import AdaptiveSwitcher
 from src.backends import RingAllReduceBackend, ParameterServerBackend
 from src.ssp import SSPEnforcer
-from src.analysis import compute_monitoring_overhead
-
-
 # ============================================================================
 # DISTRIBUTED TRAINING ENGINE
 # ============================================================================
@@ -865,17 +862,6 @@ def main() -> None:
                 results_list.append(runner.run_experiment(mode, condition))
 
     results_df = pd.DataFrame([res.__dict__ for res in results_list])
-    
-    # --- C-6 Trade-off Analysis ---
-    overhead_abs, overhead_pct = compute_monitoring_overhead(results_df)
-    print("\n" + "="*70)
-    print("C-6 Novelty Analysis: Cost of Monitoring")
-    print(f"  AdaptoSGD throughput (homogeneous): {results_df[(results_df['mode'] == CommunicationMode.ADAPTIVE) & (results_df['condition'] == 'homogeneous')]['avg_throughput'].mean():.2f} iter/s")
-    print(f"  Ring AllReduce throughput (homogeneous): {results_df[(results_df['mode'] == CommunicationMode.RING_ALLREDUCE) & (results_df['condition'] == 'homogeneous')]['avg_throughput'].mean():.2f} iter/s")
-    print(f"  -> Absolute overhead: {overhead_abs:.2f} iter/s")
-    print(f"  -> Relative overhead: {overhead_pct:.2f}%")
-    print("="*70)
-    # --- End C-6 Analysis ---
 
     generate_core_visualizations(runner, results_df, args.output_dir, show_plots)
     generate_extended_failure_visualizations(results_df, args.output_dir, show_plots)
@@ -885,8 +871,6 @@ def main() -> None:
         print("\nRunning sensitivity analysis...")
         sensitivity_df = run_sensitivity_analysis(config, args.output_dir, show_plots)
         print("Sensitivity analysis complete.")
-        if sensitivity_df is not None:
-            generate_amdahl_plot(sensitivity_df, args.output_dir, show_plots)
 
     os.makedirs(f"{args.output_dir}/data", exist_ok=True)
 
@@ -936,6 +920,26 @@ def main() -> None:
         sensitivity_df.to_csv(f"{args.output_dir}/data/sensitivity_analysis.csv", index=False)
 
     write_reproducibility_manifest(config, args, args.output_dir)
+
+    from phase3_analysis.amdahl_analysis import generate_amdahl_plot as p3_amdahl_plot
+    from phase3_analysis.convergence_analysis import generate_convergence_comparison as p3_convergence_comparison
+    from phase3_analysis.failure_analysis import generate_extended_failure_visualizations as p3_failure_viz
+    from phase3_analysis.overhead_analysis import compute_monitoring_overhead as p3_compute_monitoring_overhead
+    from phase3_analysis.scalability_analysis import generate_speedup_efficiency_plot as p3_speedup_efficiency_plot
+
+    def _phase3(name: str, fn, *args_) -> None:
+        print(f"\n[Phase 3] Starting: {name} …")
+        try:
+            fn(*args_)
+            print(f"[Phase 3] Finished: {name}.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[Phase 3] FAILED: {name}: {exc}")
+
+    _phase3("Amdahl plot", p3_amdahl_plot, config, args.output_dir, show_plots)
+    _phase3("speedup & efficiency", p3_speedup_efficiency_plot, config, args.output_dir, show_plots)
+    _phase3("convergence comparison", p3_convergence_comparison, results_df, args.output_dir, show_plots)
+    _phase3("monitoring overhead", p3_compute_monitoring_overhead, results_df, args.output_dir, show_plots)
+    _phase3("extended failure figures", p3_failure_viz, results_df, args.output_dir, show_plots)
 
     print("\n" + "=" * 70)
     print("FINAL RESULTS SUMMARY")
