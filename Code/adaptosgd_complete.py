@@ -48,53 +48,68 @@ class ExecutionBackend(Enum):
 
 @dataclass
 class SystemConfig:
-    """Configuration for distributed training simulation and emulation."""
+    """System-wide configuration parameters."""
 
     num_workers: int = 4
-    gradient_size: int = 1000
-    num_iterations: int = 200
+    gradient_size: int = 25_000_000  # ResNet-50 size
     learning_rate: float = 0.01
-    straggler_threshold: float = 1.5
-    monitor_window: int = 10
-    staleness_bound: int = 5
-    random_seed: int = 42
+    num_iterations: int = 200
+    base_compute_time: float = 0.1  # Seconds
+    
+    # Straggler simulation
+    straggler_starts_at: int = 50
+    straggler_ends_at: int = 150
     straggler_delay_factor: float = 3.5
-    straggler_start_iter: int = 50
-    straggler_end_iter: int = 100
-    base_compute_time: float = 0.05
-    convergence_threshold: float = 0.1
-    execution_backend: str = ExecutionBackend.SIMULATED.value
-    sleep_scale: float = 0.0
+    straggler_worker: int = 0
 
-    # Extended failure scenarios for robustness evaluation.
-    failure_start_iter: int = 70
-    failure_end_iter: int = 90
-    failed_worker_id: int = 1
-    network_instability_start: int = 60
-    network_instability_end: int = 120
-    network_delay_factor: float = 2.0
-
-    # NEW — Hysteresis: consecutive "clean" iterations required before switching
-    # back from PS → AllReduce (Section 2.4 of design doc).
+    # Failure simulation
+    failure_starts_at: int = 75
+    failure_ends_at: int = 125
+    
+    # Adaptive switching
+    monitoring_window: int = 10  # Check every N iterations
+    straggler_threshold: float = 1.5
     hysteresis_window: int = 5
+
+    # SSP staleness bound for PS mode
+    ssp_staleness: int = 4
+
+    # Visualization
+    show_plots: bool = True
+    
+    # Execution
+    backend: ExecutionBackend = ExecutionBackend.MULTIPROCESS
+    seed: int = 42
 
 
 @dataclass
 class MetricsSnapshot:
-    """Metrics collected at each iteration."""
+    """A snapshot of system metrics at a single iteration."""
 
     iteration: int
+    mode: str
     loss: float
     throughput: float
-    straggler_overhead: float
-    gradient_staleness: int
-    strategy_mode: str
+    total_time: float
+    straggler_active: bool
+    straggler_detected: bool
+    straggler_score: float
+    staleness: int
     worker_times: List[float]
-    failed_workers: int
-    communication_overhead: float
-    timestamp: float
-    # NEW — expose whether a SYNC_PARAMS broadcast occurred this iteration.
-    sync_params_event: bool = False
+    failed_workers: Set[int]
+
+
+@dataclass
+class ExperimentResult:
+    """Aggregated results from a single experimental run."""
+    config: SystemConfig
+    mode: CommunicationMode
+    condition: str
+    history: List[MetricsSnapshot]
+    total_runtime: float
+    avg_throughput: float
+    time_to_convergence: Optional[int]
+    switch_latency: Optional[int] = None
 
 
 # ============================================================================
@@ -142,39 +157,40 @@ class StragglerMonitor:
     def __init__(self, threshold: float = 1.5, window_size: int = 5):
         self.threshold = threshold
         self.window_size = window_size
-        self.worker_histories: List[deque] = []
-        self.straggler_detected = False
-        self.straggler_id = -1
+        self.history: deque = deque(maxlen=window_size)
+        self.last_straggler_worker_id = -1
+        self.last_score = 0.0
 
-    def update(self, worker_times: List[float], iteration: int) -> Tuple[bool, int, float]:
-        """Update monitor with latest iteration times."""
-        del iteration  # Iteration kept for API compatibility and future extensions.
-
-        if len(self.worker_histories) != len(worker_times):
-            self.worker_histories = [deque(maxlen=self.window_size) for _ in range(len(worker_times))]
-
-        for i, t in enumerate(worker_times):
-            self.worker_histories[i].append(t)
-
-        if any(len(h) < 3 for h in self.worker_histories):
+    def update(
+        self, worker_times: List[float], iteration: int
+    ) -> Tuple[bool, int, float]:
+        """Updates the monitor with new worker timings and returns straggler status."""
+        if not worker_times:
             return False, -1, 0.0
 
-        median_times = [float(np.median(h)) for h in self.worker_histories]
-        overall_median = float(np.median(median_times))
-        max_time = max(median_times)
-        slowest_worker = median_times.index(max_time)
+        self.history.append(worker_times)
 
-        straggler_score = max_time / overall_median if overall_median > 0 else 0.0
-        detected = straggler_score > self.threshold
+        # Use the most recent set of times for detection
+        latest_times = np.array(self.history[-1])
 
-        if detected and not self.straggler_detected:
-            self.straggler_detected = True
-            self.straggler_id = slowest_worker
-        elif not detected and self.straggler_detected:
-            self.straggler_detected = False
-            self.straggler_id = -1
+        t_max = np.max(latest_times)
+        t_median = np.median(latest_times)
 
-        return detected, slowest_worker, straggler_score
+        if t_median == 0:
+            score = 0.0
+        else:
+            score = t_max / t_median
+
+        self.last_score = score
+        straggler_detected = score > self.threshold
+
+        if straggler_detected:
+            self.last_straggler_worker_id = int(np.argmax(latest_times))
+        else:
+            # We don't reset the worker ID, so we can report who the *last* straggler was
+            pass
+
+        return straggler_detected, self.last_straggler_worker_id, score
 
 
 # ============================================================================
@@ -194,57 +210,41 @@ class AdaptiveSwitcher:
 
     def __init__(self, config: SystemConfig):
         self.config = config
-        self.monitor = StragglerMonitor(threshold=config.straggler_threshold, window_size=5)
+        self.monitor = StragglerMonitor(
+            threshold=config.straggler_threshold, window_size=config.monitoring_window
+        )
         self.current_mode = CommunicationMode.RING_ALLREDUCE
-        self.switch_history: List[Dict] = []
+        self.hysteresis_window = config.hysteresis_window
+        self.switch_history: List[Tuple[int, str, float]] = []
+        self.clean_iterations_count = 0
 
-        # NEW — hysteresis state.
-        self._clean_streak: int = 0  # consecutive iters with no straggler detected
+    def evaluate_and_switch(
+        self, worker_times: List[float], iteration: int
+    ) -> Tuple[CommunicationMode, bool]:
+        """Applies switching logic based on straggler score."""
+        straggler_detected, _, _ = self.monitor.update(worker_times, iteration)
+        switched = False
 
-    def evaluate_and_switch(self, worker_times: List[float], iteration: int) -> Tuple[CommunicationMode, bool]:
-        """Return (new_mode, sync_params_needed).
-
-        sync_params_needed is True only when switching PS → AllReduce so the
-        caller can simulate a SYNC_PARAMS broadcast (Section 4.3).
-        """
-        detected, straggler_id, score = self.monitor.update(worker_times, iteration)
-        sync_params_needed = False
-
-        if detected:
-            # Reset the clean-streak whenever a straggler is (re-)detected.
-            self._clean_streak = 0
-
-            if self.current_mode == CommunicationMode.RING_ALLREDUCE:
+        if self.current_mode == CommunicationMode.RING_ALLREDUCE:
+            if straggler_detected:
                 self.current_mode = CommunicationMode.PARAMETER_SERVER
-                self.switch_history.append(
-                    {
-                        "iteration": iteration,
-                        "from": "ring_allreduce",
-                        "to": "parameter_server",
-                        "straggler_id": straggler_id,
-                        "score": score,
-                    }
-                )
-        else:
-            # Straggler gone — increment clean streak and only switch back once
-            # hysteresis_window consecutive clean iterations have elapsed.
-            if self.current_mode == CommunicationMode.PARAMETER_SERVER:
-                self._clean_streak += 1
-                if self._clean_streak >= self.config.hysteresis_window:
-                    self._clean_streak = 0
+                self.clean_iterations_count = 0  # Reset counter on switch to PS
+                switched = True
+                self.switch_history.append((iteration, "PS", self.monitor.last_score))
+        elif self.current_mode == CommunicationMode.PARAMETER_SERVER:
+            if not straggler_detected:
+                self.clean_iterations_count += 1
+                if self.clean_iterations_count >= self.hysteresis_window:
                     self.current_mode = CommunicationMode.RING_ALLREDUCE
-                    sync_params_needed = True  # trigger SYNC_PARAMS broadcast
+                    switched = True
                     self.switch_history.append(
-                        {
-                            "iteration": iteration,
-                            "from": "parameter_server",
-                            "to": "ring_allreduce",
-                            "straggler_id": -1,
-                            "score": score,
-                        }
+                        (iteration, "RING_ALLREDUCE", self.monitor.last_score)
                     )
+            else:
+                # If a straggler is detected again, reset the clean counter
+                self.clean_iterations_count = 0
 
-        return self.current_mode, sync_params_needed
+        return self.current_mode, switched
 
 
 # ============================================================================
@@ -322,10 +322,10 @@ class DistributedTrainer:
                 self.straggler_active = True
                 self.straggler_worker = 0
         elif condition == "dynamic":
-            if iteration == self.config.straggler_start_iter:
+            if iteration == self.config.straggler_starts_at:
                 self.straggler_active = True
                 self.straggler_worker = 0
-            elif iteration == self.config.straggler_end_iter:
+            elif iteration == self.config.straggler_ends_at:
                 self.straggler_active = False
                 self.straggler_worker = -1
 
@@ -333,7 +333,7 @@ class DistributedTrainer:
         failed_workers: Set[int] = set()
         network_factor = 1.0
 
-        if condition == "worker_failure" and self.config.failure_start_iter <= iteration < self.config.failure_end_iter:
+        if condition == "worker_failure" and self.config.failure_starts_at <= iteration < self.config.failure_ends_at:
             failed_workers.add(self.config.failed_worker_id)
 
         if condition == "network_instability" and self.config.network_instability_start <= iteration < self.config.network_instability_end:
@@ -526,11 +526,14 @@ class DistributedTrainer:
 
             snapshot = MetricsSnapshot(
                 iteration=iteration,
+                mode=self.current_mode.value,
                 loss=loss,
                 throughput=throughput,
-                straggler_overhead=idle_time,
-                gradient_staleness=staleness,
-                strategy_mode=(self.current_mode.value if self.mode == CommunicationMode.ADAPTIVE else self.mode.value),
+                total_time=iteration_time,
+                straggler_active=self.straggler_active,
+                straggler_detected=self.switcher.monitor.straggler_detected,
+                straggler_score=self.switcher.monitor.last_score,
+                staleness=staleness,
                 worker_times=[float(t) if np.isfinite(t) else -1.0 for t in worker_times],
                 failed_workers=failed_count,
                 communication_overhead=communication_overhead,
@@ -558,53 +561,64 @@ class DistributedTrainer:
 class ExperimentRunner:
     """Runs and aggregates experiments across strategies and conditions."""
 
-    def __init__(self, config: SystemConfig):
-        self.config = config
-        self.results: Dict[str, Dict] = {}
+    def __init__(self, base_config: SystemConfig):
+        self.base_config = base_config
+        self.results: List[ExperimentResult] = []
 
-    def run_experiment(self, system_type: str, condition: str, seed: int) -> Dict:
-        np.random.seed(seed)
-        mode = CommunicationMode(system_type)
-        trainer = DistributedTrainer(self.config, mode)
+    def run_experiment(
+        self, mode: CommunicationMode, condition: str
+    ) -> ExperimentResult:
+        """Runs a single experiment for a given mode and condition."""
+        config = dataclasses.replace(self.base_config)
+        print(f"🚀 Running experiment: {mode.value} under {condition}...")
 
-        metrics = trainer.run(condition)
+        trainer = DistributedTrainer(config, mode)
+        
+        start_time = time.monotonic()
+        history = trainer.run(condition)
+        total_runtime = time.monotonic() - start_time
 
-        throughput_values = [m.throughput for m in metrics]
-        loss_values = [m.loss for m in metrics]
-        overhead_values = [m.straggler_overhead for m in metrics]
-        staleness_values = [m.gradient_staleness for m in metrics]
-        failed_values = [m.failed_workers for m in metrics]
-        comm_values = [m.communication_overhead for m in metrics]
-        # NEW — count SYNC_PARAMS events across the run.
-        sync_event_count = sum(1 for m in metrics if m.sync_params_event)
+        avg_throughput = np.mean([m.throughput for m in history if m.throughput > 0])
+        
+        time_to_convergence = next(
+            (m.iteration for m in history if m.loss < 0.1), None
+        )
 
-        convergence_iter = None
-        for m in metrics:
-            if m.loss < self.config.convergence_threshold:
-                convergence_iter = m.iteration
-                break
+        # --- NEW: Calculate Switch Latency ---
+        switch_latency = None
+        if mode == CommunicationMode.ADAPTIVE and trainer.switcher.switch_history:
+            # Find the first switch to Parameter Server mode
+            first_switch = next(
+                (s for s in trainer.switcher.switch_history if s[1] == "PS"), None
+            )
+            if first_switch:
+                switch_iteration = first_switch[0]
+                # Latency is the difference from when the straggler was introduced
+                if switch_iteration >= config.straggler_starts_at:
+                    switch_latency = switch_iteration - config.straggler_starts_at
+        # --- END NEW ---
 
-        return {
-            "system": system_type,
-            "condition": condition,
-            "seed": seed,
-            "mean_throughput": float(np.mean(throughput_values)),
-            "std_throughput": float(np.std(throughput_values)),
-            "final_loss": float(loss_values[-1]),
-            "mean_overhead": float(np.mean(overhead_values)),
-            "max_overhead": float(max(overhead_values)),
-            "mean_staleness": float(np.mean(staleness_values)),
-            "max_staleness": int(max(staleness_values)),
-            "mean_failed_workers": float(np.mean(failed_values)),
-            "mean_communication_overhead": float(np.mean(comm_values)),
-            "convergence_iter": convergence_iter,
-            "total_time": float(metrics[-1].timestamp),
-            "raw_metrics": metrics,
-            "switch_history": trainer.switch_history if system_type == CommunicationMode.ADAPTIVE.value else [],
-            "sync_event_count": sync_event_count,  # NEW
-        }
+        result = ExperimentResult(
+            config=config,
+            mode=mode,
+            condition=condition,
+            history=history,
+            total_runtime=total_runtime,
+            avg_throughput=avg_throughput,
+            time_to_convergence=time_to_convergence,
+            switch_latency=switch_latency,
+        )
+        self.results.append(result)
+        
+        print(f"   -> Finished in {total_runtime:.2f}s. Avg throughput: {avg_throughput:.2f} iter/s.")
+        if time_to_convergence:
+            print(f"   -> Reached convergence at iteration {time_to_convergence}.")
+        if switch_latency is not None:
+            print(f"   -> Detected switch latency: {switch_latency} iterations.")
 
-    def run_all(self, num_runs: int = 5, include_extended: bool = True) -> pd.DataFrame:
+        return result
+
+    def run_all(self, conditions: List[str]) -> None:
         systems = [
             CommunicationMode.RING_ALLREDUCE.value,
             CommunicationMode.PARAMETER_SERVER.value,
