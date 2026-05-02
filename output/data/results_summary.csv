@@ -1,16 +1,16 @@
-System,Condition,Throughput (iter/s),Final Loss,Avg Overhead (s),Avg Staleness,Avg Failed Workers,Avg Comm Overhead (s)
-AdaptoSGD,Dynamic,10.13 +- 0.00,-0.0063,0.0218,0.80,0.00,0.0339
-AdaptoSGD,Homogeneous,10.40 +- 0.00,-0.0064,0.0120,0.00,0.00,0.0400
-AdaptoSGD,Network Instability,9.49 +- 0.00,-0.0064,0.0120,0.00,0.00,0.0520
-AdaptoSGD,Static,11.25 +- 0.00,-0.0058,0.0130,4.50,0.00,0.0058
-AdaptoSGD,Worker Failure,10.42 +- 0.00,-0.0064,0.0117,0.00,0.10,0.0400
-Parameter Server,Dynamic,17.36 +- 0.00,-0.0057,0.0000,5.00,0.00,0.0020
-Parameter Server,Homogeneous,19.16 +- 0.00,-0.0057,0.0000,5.00,0.00,0.0020
-Parameter Server,Network Instability,18.95 +- 0.00,-0.0057,0.0000,5.00,0.00,0.0026
-Parameter Server,Static,11.99 +- 0.00,-0.0057,0.0000,5.00,0.00,0.0020
-Parameter Server,Worker Failure,19.17 +- 0.00,-0.0057,0.0000,5.00,0.10,0.0021
-Ring AllReduce,Dynamic,8.96 +- 0.00,-0.0064,0.0414,0.00,0.00,0.0400
-Ring AllReduce,Homogeneous,10.40 +- 0.00,-0.0064,0.0120,0.00,0.00,0.0400
-Ring AllReduce,Network Instability,9.49 +- 0.00,-0.0064,0.0120,0.00,0.00,0.0520
-Ring AllReduce,Static,4.65 +- 0.00,-0.0064,0.1299,0.00,0.00,0.0400
-Ring AllReduce,Worker Failure,10.42 +- 0.00,-0.0064,0.0117,0.00,0.10,0.0400
+System,Condition,Throughput (iter/s),Effective Throughput,Final Loss,Avg Overhead (s),Avg Staleness,Avg Failed Workers,Avg Comm Overhead (s)
+Ring Allreduce,Homogeneous,6.57 +- 0.00,6.57,0.0058,0.0400,0.00,0.00,0.0400
+Ring Allreduce,Static,2.55 +- 0.00,2.55,-0.0074,0.0400,0.00,0.00,0.0400
+Ring Allreduce,Dynamic,6.57 +- 0.00,6.57,-0.0053,0.0400,0.00,0.00,0.0400
+Ring Allreduce,Worker Failure,6.57 +- 0.00,6.57,0.0119,0.0400,0.00,0.00,0.0400
+Ring Allreduce,Network Instability,6.57 +- 0.00,6.57,-0.0104,0.0400,0.00,0.00,0.0400
+Parameter Server,Homogeneous,9.21 +- 0.00,0.00,-0.0037,0.0080,70.50,0.00,0.0080
+Parameter Server,Static,5.82 +- 0.00,0.00,0.0220,0.0080,70.50,0.00,0.0080
+Parameter Server,Dynamic,9.21 +- 0.00,0.00,0.0091,0.0080,70.50,0.00,0.0080
+Parameter Server,Worker Failure,9.21 +- 0.00,0.00,-0.0021,0.0080,70.50,0.00,0.0080
+Parameter Server,Network Instability,9.21 +- 0.00,0.00,-0.0062,0.0080,70.50,0.00,0.0080
+Adaptive,Homogeneous,6.57 +- 0.00,6.57,0.0010,0.0400,0.00,0.00,0.0400
+Adaptive,Static,5.82 +- 0.00,0.00,0.0283,0.0080,70.50,0.00,0.0080
+Adaptive,Dynamic,6.57 +- 0.00,6.57,0.0017,0.0400,0.00,0.00,0.0400
+Adaptive,Worker Failure,6.57 +- 0.00,6.57,-0.0016,0.0400,0.00,0.00,0.0400
+Adaptive,Network Instability,6.57 +- 0.00,6.57,0.0115,0.0400,0.00,0.00,0.0400
